@@ -12,7 +12,7 @@ from collections import deque
 # --- Configuration ---
 TARGET_SR = 16000  # Target sample rate for Whisper
 HOP_SECONDS = 0.4  # Process audio in 400ms chunks for responsiveness
-MODEL_NAME = "base.en" # The Whisper model to use
+MODEL_NAME = "tiny.en" # The Whisper model to use
 
 class EnhancedAudioProcessor:
     """
@@ -31,8 +31,9 @@ class EnhancedAudioProcessor:
         with self._model_lock:
             if self._whisper_model is None:
                 print(f"🔄 Loading faster-whisper model: {MODEL_NAME}")
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                compute_type = "float16" if device == "cuda" else "int8"
+                # Force CPU usage and use int8 for smaller memory footprint
+                device = "cpu"
+                compute_type = "int8"
                 self._whisper_model = WhisperModel(
                     MODEL_NAME,
                     device=device,
@@ -68,14 +69,25 @@ class EnhancedAudioProcessor:
             return ""
 
     def start_ptt_recording(self):
-        """Starts the PTT recording process in a new thread."""
+        """Starts the PTT recording process in a new thread, with a brief delay."""
         if self.is_recording.is_set():
             return
-        self._audio_buffer.clear()
-        self.is_recording.set()
-        ptt_thread = threading.Thread(target=self._ptt_record_loop, daemon=True)
-        ptt_thread.start()
-        print("🔴 PTT Recording thread started.")
+        # Small delay to allow initial model warm-up on first use
+        delay_seconds = 0.75
+
+        def _begin_recording():
+            if self.is_recording.is_set():
+                return
+            self._audio_buffer.clear()
+            self.is_recording.set()
+            ptt_thread = threading.Thread(target=self._ptt_record_loop, daemon=True)
+            ptt_thread.start()
+            print("🔴 PTT Recording thread started.")
+
+        timer = threading.Timer(delay_seconds, _begin_recording)
+        timer.daemon = True
+        timer.start()
+        print(f"⏳ Delaying PTT start by {delay_seconds:.2f}s...")
 
     def stop_ptt_recording(self) -> np.ndarray | None:
         """Stops PTT recording and returns the full audio data."""
@@ -92,7 +104,9 @@ class EnhancedAudioProcessor:
     def _ptt_record_loop(self):
         """The loop that actively records audio while PTT is active."""
         try:
-            device_info = sd.query_default_speakers()
+            # --- THE FIX IS HERE ---
+            # Query the default INPUT device (microphone), not the output device (speakers).
+            device_info = sd.query_devices(kind='input')
             device_sr = int(device_info['default_samplerate'])
             chunk_samples = int(device_sr * HOP_SECONDS)
             with sd.InputStream(samplerate=device_sr, channels=1, dtype=np.float32, blocksize=chunk_samples) as stream:
